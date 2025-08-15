@@ -1,1 +1,1 @@
-worker: python lyrics_bot.py
+worker: python -u lyrics_bot.py
