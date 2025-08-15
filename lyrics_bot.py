@@ -1,112 +1,391 @@
 # -*- coding: utf-8 -*-
-import os, re, asyncio
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import quote_plus, urlparse
-from difflib import get_close_matches
-from typing import Optional, List
+import os, re, html, asyncio, logging, time
+from typing import List, Optional, Tuple, Dict, Callable
 
+import aiohttp
+from bs4 import BeautifulSoup, NavigableString
+from rapidfuzz import fuzz
 from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ===== Arabic shaping (preferred; falls back automatically) =====
-try:
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-    AR_SHAPING = True
-except Exception:
-    AR_SHAPING = False
+# ============ إعدادات عامة ============
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("lyrics-bot-ar")
 
-# =================== Config / constants ===================
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
-HTTP_TIMEOUT = 8  # per request
-
-AR_RANGE = r'\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF'
-AR_REGEX = re.compile(f'[{AR_RANGE}]')
-AR_KEYWORDS = ["كلمات", "كلمات أغنية", "كلمات الاغنية", "كلمات الأغنية", "Lyrics"]
-
-# preferred Arabic domains (we try them before generic search)
-AR_PREFERRED_SITES = [
-    "lyricat.com", "lyricsarabic.com", "arabiclyrics.net",
-    "arabiclyrics.co", "ghina4lyrics.com", "lyrics-jo.com", "lyricstranslate.com"
-]
-BLACKLIST = ("youtube.com","youtu.be","twitter.com","facebook.com","instagram.com",
-             "tiktok.com","soundcloud.com","spotify.com","apple.com","deezer.com")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=25)
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+HEADERS = {"User-Agent": UA, "Accept-Language": "ar,en;q=0.9"}
 
 HELP_TEXT = (
-    "أرسل اسم الفنان واسم الأغنية:\n"
-    "`/lyrics Eminem - Superman`\n"
-    "أو بالعربي: `/lyrics عمرو دياب - تملي معاك`\n"
-    "تقدر كمان ترسل رسالة عادية فيها `فنان - أغنية` بدون أمر.\n"
+    "أرسل اسم الأغنية والفنان بأي صيغة، وسأجلب الكلمات — بدون أي API.\n"
+    "أمثلة:\n"
+    "• عمرو دياب تملي معاك\n"
+    "• Elissa - Aa Bali Habibi\n"
+    "• lyrics eminem venom\n"
+    "أو استخدم: /lyrics عمرو دياب تملي معاك"
 )
 
-# =================== helpers ===================
-def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> requests.Response:
-    headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,ar;q=0.8"}
-    resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-    resp.raise_for_status()
-    return resp
+# ============ تطبيع عربي + تحليل ============
+_AR_DIAC = re.compile(r"[\u0617-\u061A\u064B-\u0652\u0670\u06D6-\u06ED]")
+_PUNCT   = re.compile(r"[^\w\s\u0600-\u06FF]+", re.UNICODE)
+_AR_CHARS= re.compile(r"[\u0600-\u06FF]")
 
-def looks_arabic(text: str) -> bool:
-    return bool(AR_REGEX.search(text or ""))
+def normalize_ar(s: str) -> str:
+    s = str(s or "").strip()
+    s = _AR_DIAC.sub("", s)
+    s = (s.replace("أ","ا").replace("إ","ا").replace("آ","ا")
+           .replace("ى","ي").replace("ئ","ي").replace("ؤ","و")
+           .replace("ة","ه").replace("گ","ك").replace("پ","ب")
+           .replace("چ","ج").replace("ژ","ز"))
+    s = _PUNCT.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = re.sub(r"\b(كلمات|اغنيه|أغنيه|أغنية|اغنية|lyrics|by|song|feat|ft)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def normalize_title(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r'\s+', ' ', s)
-    s = re.sub(r'[\(\)\[\]\{\}\-–—_:;\'"!.?,/\\]+', ' ', s)
-    s = s.replace('&', 'and')
-    return s.strip()
+def split_artist_title(q: str) -> Tuple[str, str]:
+    q_norm = normalize_ar(q)
+    parts = re.split(r"\s[-–—]\s|[-–—]|:|\|", q)
+    if len(parts) >= 2:
+        return normalize_ar(parts[0]), normalize_ar(" ".join(parts[1:]))
+    tokens = q_norm.split()
+    if len(tokens) >= 3:
+        return " ".join(tokens[:-2]), " ".join(tokens[-2:])
+    return "", q_norm
 
-def visual_ar_fallback(text: str) -> str:
-    # Keep RTL direction; letters may be unshaped if libs missing.
-    def reverse_ar_runs(line: str) -> str:
-        out, buf, in_ar = [], [], None
-        for ch in line:
-            is_ar = bool(AR_REGEX.match(ch))
-            if in_ar is None: in_ar = is_ar
-            if is_ar == in_ar: buf.append(ch)
-            else:
-                out.append(''.join(reversed(buf)) if in_ar else ''.join(buf))
-                buf, in_ar = [ch], is_ar
-        if buf: out.append(''.join(reversed(buf)) if in_ar else ''.join(buf))
-        return ''.join(out)
-    return '\n'.join(reverse_ar_runs(ln) for ln in (text or "").splitlines())
+# ============ كاش ============
+_CACHE: Dict[str, Tuple[float, Tuple[Optional[str], Optional[str]]]] = {}
+CACHE_TTL = 60 * 60  # 1h
 
-def shape_arabic_for_display(text: str) -> str:
-    if looks_arabic(text):
-        if AR_SHAPING:
-            try:
-                return get_display(arabic_reshaper.reshape(text))
-            except Exception:
-                pass
-        return visual_ar_fallback(text)
-    return text or ""
+def cache_get(key: str):
+    item = _CACHE.get(key)
+    if not item: return None
+    ts, val = item
+    if time.time() - ts > CACHE_TTL:
+        _CACHE.pop(key, None); return None
+    return val
 
-# =================== AZLyrics ===================
-def search_azlyrics_links(artist: str, song: str) -> List[str]:
-    q_patterns = [
-        f'site:azlyrics.com "{artist}" "{song}" lyrics',
-        f'site:azlyrics.com {artist} {song} lyrics',
-        f'{artist} {song} site:azlyrics.com lyrics'
-    ]
-    link_re = re.compile(r'https?://www\.azlyrics\.com/lyrics/[^"\'> ]+\.html')
-    urls, seen = [], set()
-    engines = ["https://www.bing.com/search?q=", "https://duckduckgo.com/html/?q="]
-    for qp in q_patterns:
-        for base in engines:
-            try:
-                html = http_get(base + quote_plus(qp)).text
-            except Exception:
+def cache_set(key: str, val):
+    _CACHE[key] = (time.time(), val)
+
+# ============ مصادر / نطاقات ============
+# عرب + عالميين (الأسماء تقريبية؛ “generic_ar” سيحاول استنتاج النص الأكبر بالعربية)
+DOMAIN_KIND = {
+    "genius.com": "genius",
+    "www.genius.com": "genius",
+    "azlyrics.com": "azlyrics",
+    "www.azlyrics.com": "azlyrics",
+    "lyricstranslate.com": "lyricstranslate",
+    "www.lyricstranslate.com": "lyricstranslate",
+
+    # عرب (يُجلب عبر Generic Arabic Fetcher)
+    "klyric.com": "generic_ar",
+    "www.klyric.com": "generic_ar",
+    "arabiclyrics.net": "generic_ar",
+    "www.arabiclyrics.net": "generic_ar",
+    "shen3a.com": "generic_ar",
+    "www.shen3a.com": "generic_ar",
+    "nogomi.com": "generic_ar",
+    "www.nogomi.com": "generic_ar",
+    "el7l7.com": "generic_ar",
+    "www.el7l7.com": "generic_ar",
+    "fay3.com": "generic_ar",
+    "www.fay3.com": "generic_ar",
+    "mawaly.com": "generic_ar",
+    "www.mawaly.com": "generic_ar",
+    "rotana.net": "generic_ar",
+    "www.rotana.net": "generic_ar",
+}
+
+ALLOWED_HOSTS = set(DOMAIN_KIND.keys())
+
+# ============ بحث DuckDuckGo (بدون API) ============
+async def ddg_search(session: aiohttp.ClientSession, query: str, limit: int = 12) -> List[Tuple[str,str]]:
+    try:
+        url = "https://duckduckgo.com/html/"
+        async with session.get(url, params={"q": query + " كلمات اغنية lyrics"}) as r:
+            r.raise_for_status()
+            text = await r.text()
+        soup = BeautifulSoup(text, "html.parser")
+        out = []
+        for a in soup.select(".result__a"):
+            title = a.get_text(" ", strip=True)
+            href  = a.get("href") or ""
+            if not href: continue
+            out.append((title, href))
+            if len(out) >= limit: break
+        return out
+    except Exception as e:
+        log.debug("DDG search failed: %s", e)
+        return []
+
+def pick_from_ddg(query_norm: str, hits: List[Tuple[str,str]]) -> Optional[Tuple[str,str,str]]:
+    ranked = []
+    for title, url in hits:
+        host = re.sub(r"^https?://", "", url).split("/")[0].lower()
+        if host not in ALLOWED_HOSTS:
+            continue
+        score = fuzz.WRatio(query_norm, normalize_ar(title))
+        ranked.append((score, DOMAIN_KIND[host], title, url))
+    if not ranked: return None
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    if ranked[0][0] < 58:  # عتبة معقولة
+        return None
+    _, kind, title, url = ranked[0]
+    return kind, title, url
+
+# ============ Fetchers خاصة ============
+async def fetch_genius(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(url) as r:
+            r.raise_for_status()
+            html_text = await r.text()
+        soup = BeautifulSoup(html_text, "html.parser")
+        blocks = soup.select("[data-lyrics-container='true']")
+        if blocks:
+            lines = []
+            for b in blocks:
+                for br in b.find_all("br"): br.replace_with("\n")
+                t = b.get_text("\n", strip=True)
+                if t: lines.append(t)
+            text = "\n".join(lines).strip()
+            return html.unescape(text) if text else None
+        old = soup.find("div", class_="lyrics")
+        if old:
+            return html.unescape(old.get_text("\n", strip=True))
+    except Exception as e:
+        log.debug("genius fetch err: %s", e)
+    return None
+
+async def fetch_azlyrics(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(url) as r:
+            r.raise_for_status()
+            html_text = await r.text()
+        soup = BeautifulSoup(html_text, "html.parser")
+        candidates = [d for d in soup.select("div") if not d.get("class")]
+        best = ""
+        for d in candidates:
+            t = d.get_text("\n", strip=True)
+            if t and len(t) > len(best): best = t
+        return best or None
+    except Exception:
+        return None
+
+async def fetch_lyricstranslate(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(url) as r:
+            r.raise_for_status()
+            html_text = await r.text()
+        soup = BeautifulSoup(html_text, "html.parser")
+        blocks = soup.select(".lyrics_text") or soup.select(".lt-lyrics")
+        lines = []
+        for b in blocks:
+            for br in b.find_all("br"): br.replace_with("\n")
+            t = b.get_text("\n", strip=True)
+            if t: lines.append(t)
+        return "\n".join(lines).strip() or None
+    except Exception:
+        return None
+
+# ============ Fetcher عربي عام (Density Heuristic) ============
+def _strip_noise(soup: BeautifulSoup) -> None:
+    for tag in soup(["script","style","noscript","iframe","svg","header","footer","nav","aside"]):
+        tag.decompose()
+    # عناصر شائعة مزعجة
+    for cls in ["breadcrumb","sidebar","menu","share","social","comments","ads","ad","related","tags","author","copyright"]:
+        for t in soup.select(f".{cls}"):
+            t.decompose()
+    for idn in ["breadcrumb","sidebar","menu","share","comments","ads","related","footer","header","nav"]:
+        for t in soup.select(f"#{idn}"):
+            t.decompose()
+
+def _block_score(elem) -> int:
+    # يعطي نقاط أعلى لكتل عربية أكبر
+    if isinstance(elem, NavigableString): return 0
+    txt = elem.get_text("\n", strip=True)
+    if not txt: return 0
+    if not _AR_CHARS.search(txt):  # لازم يحتوي أحرف عربية
+        return 0
+    # درجة = طول النص - عدد الروابط
+    links = len(elem.find_all("a"))
+    return max(0, len(txt) - links * 20)
+
+async def fetch_generic_ar(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(url) as r:
+            r.raise_for_status()
+            html_text = await r.text()
+        soup = BeautifulSoup(html_text, "html.parser")
+        _strip_noise(soup)
+        # جرّب كتل مرشحة
+        candidates = soup.select("article, .post, .content, .entry, .lyrics, .post-content, .entry-content, .page-content, .single-content, main") or soup.select("div,section")
+        best_block, best_score = None, -1
+        for el in candidates:
+            sc = _block_score(el)
+            if sc > best_score:
+                best_score, best_block = sc, el
+        if not best_block:
+            return None
+        # معالجة الأسطر
+        for br in best_block.find_all("br"): br.replace_with("\n")
+        text = best_block.get_text("\n", strip=True)
+        # فلترة بسيطة: نرمي سطور قصيرة جدًا
+        lines = [ln for ln in text.splitlines() if len(ln.strip()) >= 2]
+        text = "\n".join(lines).strip()
+        # تأكد وجود قدر كافٍ من العربية
+        if not _AR_CHARS.search(text) or len(text) < 60:
+            return None
+        return text
+    except Exception as e:
+        log.debug("generic_ar fetch err: %s", e)
+        return None
+
+FETCHERS: Dict[str, Callable[[aiohttp.ClientSession, str], asyncio.Future]] = {
+    "genius": fetch_genius,
+    "azlyrics": fetch_azlyrics,
+    "lyricstranslate": fetch_lyricstranslate,
+    "generic_ar": fetch_generic_ar,
+}
+
+# ============ منطق الجلب الرئيسي ============
+async def get_lyrics(query: str) -> Tuple[Optional[str], Optional[str]]:
+    qkey = normalize_ar(query)
+    cached = cache_get(qkey)
+    if cached: return cached
+
+    artist, title = split_artist_title(query)
+    query_norm = normalize_ar(f"{artist} {title}".strip() or query)
+
+    async with aiohttp.ClientSession(headers=HEADERS, timeout=HTTP_TIMEOUT) as session:
+        # 1) Genius أولاً (أفضل جودة تنسيق)
+        try:
+            url_api = "https://genius.com/api/search/multi"
+            async with session.get(url_api, params={"q": f"{artist} {title}".strip() or query}) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    secs = (data.get("response") or {}).get("sections") or []
+                    song_hits = []
+                    for sec in secs:
+                        if sec.get("type") == "song":
+                            for hit in sec.get("hits", []):
+                                res = hit.get("result") or {}
+                                song_hits.append({
+                                    "title": res.get("title",""),
+                                    "artist": ((res.get("primary_artist") or {}).get("name")) or "",
+                                    "url": res.get("url",""),
+                                })
+                    # Pick best by fuzzy
+                    ranked = []
+                    for it in song_hits:
+                        key = normalize_ar(f"{it['artist']} {it['title']}")
+                        ranked.append((fuzz.WRatio(query_norm, key), it))
+                    ranked.sort(key=lambda x: x[0], reverse=True)
+                    if ranked and ranked[0][0] >= 70:
+                        best = ranked[0][1]
+                        lyr = await fetch_genius(session, best["url"])
+                        if lyr:
+                            out = (lyr, f"{best['artist']} – {best['title']} (Genius)")
+                            cache_set(qkey, out)
+                            return out
+        except Exception as e:
+            log.debug("Genius failed: %s", e)
+
+        # 2) DuckDuckGo → اختيار أفضل نطاق (عربي/عالمي) → جلب
+        patterns = [f"{artist} {title}".strip(), f"{title} {artist}".strip(), query]
+        for pat in patterns:
+            if not pat: continue
+            hits = await ddg_search(session, pat, limit=14)
+            pick = pick_from_ddg(query_norm, hits)
+            if not pick:
                 continue
-            for u in link_re.findall(html):
-                if u not in seen:
-                    seen.add(u); urls.append(u)
-        if urls: break
-    return urls[:5]
+            kind, title_txt, url = pick
+            fetcher = FETCHERS.get(kind)
+            if not fetcher:
+                continue
+            lyr = await fetcher(session, url)
+            if lyr:
+                out = (lyr, f"{title_txt} — {url}")
+                cache_set(qkey, out)
+                return out
 
-def guess_artist_from_az_index(artist_name: str) -> Optional[str]:
+    out = (None, None)
+    cache_set(qkey, out)
+    return out
+
+# ============ تيليجرام ============
+def extract_query(text: str) -> str:
+    t = text or ""
+    t = re.sub(r"^/(lyric|lyrics)\s*", "", t, flags=re.I).strip()
+    t = re.sub(r"^\s*(كلمات|اغنيه|أغنيه|أغنية)\s*", "", t, flags=re.I).strip()
+    return t
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hi! 👋\nSend the song name (artist + title) in Arabic or English and I'll fetch the lyrics — no API.\n\n"
+        + HELP_TEXT + "\n\nDeveloped by @Ghostnosd"
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def lyrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = extract_query(" ".join(context.args)) if context.args else ""
+    if not query:
+        await update.message.reply_text("اكتب اسم الأغنية والفنان، مثال: عمرو دياب تملي معاك")
+        return
+    await run_lookup(update, query)
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+    if not txt: return
+    if txt.startswith("/lyrics"):
+        q = extract_query(txt)
+        if not q:
+            await update.message.reply_text("اكتب اسم الأغنية بعد /lyrics")
+            return
+        await run_lookup(update, q)
+    else:
+        await run_lookup(update, txt)
+
+async def run_lookup(update: Update, query: str):
+    status = await update.message.reply_text("⏳ يبحث عن الكلمات…")
+    try:
+        lyrics, credit = await get_lyrics(query)
+        if lyrics:
+            MAX = 3800
+            chunks = [lyrics[i:i+MAX] for i in range(0, len(lyrics), MAX)]
+            header = f"🎵 {credit}\n\n"
+            await status.edit_text(header + chunks[0])
+            for ch in chunks[1:]:
+                await update.message.reply_text(ch)
+        else:
+            await status.edit_text(
+                "❌ ما لقيت كلمات تلقائياً.\n"
+                "جرّب صيغة أوضح: *الفنان – اسم الأغنية* أو *عمرو دياب تملي معاك*."
+            )
+    except Exception as e:
+        log.exception("lookup failed")
+        await status.edit_text(f"تعذّر الجلب: {e}")
+
+# ============ تشغيل ============
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("ضبط متغير البيئة BOT_TOKEN بتوكن البوت.")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("lyrics", lyrics_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    log.info("Lyrics bot (AR, no API) running…")
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()def guess_artist_from_az_index(artist_name: str) -> Optional[str]:
     if not artist_name: return None
     first_char = (artist_name.strip()[:1] or '').lower()
     if not first_char: return None
