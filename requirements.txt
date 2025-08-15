@@ -1,4 +1,4 @@
-python-telegram-bot==20.3
-requests
-beautifulsoup4
-python-bidi
+python-telegram-bot==21.4
+aiohttp>=3.9
+beautifulsoup4>=4.12.3
+rapidfuzz>=3.9.6
