@@ -385,7 +385,8 @@ def main():
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    main()def guess_artist_from_az_index(artist_name: str) -> Optional[str]:
+    main()def
+    guess_artist_from_az_index(artist_name: str) -> Optional[str]:
     if not artist_name: return None
     first_char = (artist_name.strip()[:1] or '').lower()
     if not first_char: return None
